@@ -214,29 +214,35 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not files:
             await query.edit_message_text("⚠️ No files to delete.", reply_markup=add_back_button([]))
             return
-        buttons = [[InlineKeyboardButton(f, callback_data=f"delete_file_select|{name}")] for name in files]
+        
+        # Store mapping of short keys -> filenames
+        file_map = {}
+        buttons = []
+        for idx, filename in enumerate(files.keys()):
+            key = f"file{idx}"
+            file_map[key] = filename
+            buttons.append([InlineKeyboardButton(filename[:40], callback_data=f"delete_file_select|{key}")])  # show short name
+        
+        context.user_data["file_map"] = file_map
         await query.edit_message_text("🗑️ Select a file to delete:", reply_markup=add_back_button(buttons))
         return
 
     # ---- DELETE SELECTED FILE ----
     if query.data.startswith("delete_file_select|") and is_admin:
-        filename = query.data.split("|")[1]
+        key = query.data.split("|")[1]
+        filename = context.user_data.get("file_map", {}).get(key)
+        if not filename:
+            await query.answer("❌ File not found", show_alert=True)
+            return
+    
         folder = get_current_folder(path) if path else folder_storage
         if filename in folder.get("files", {}):
             del folder["files"][filename]
             save_data()
-            buttons = [
-                [InlineKeyboardButton("📁 Create Folder", callback_data="create_folder_current")],
-                [InlineKeyboardButton("📤 Upload File", callback_data="upload_current")],
-                [InlineKeyboardButton("❌ Delete Folder", callback_data="delete_folder_current")],
-                [InlineKeyboardButton("🗑️ Delete File", callback_data="delete_file_current")]
-            ]
-            await query.edit_message_text(f"✅ File '{filename}' deleted.", reply_markup=add_back_button(buttons))
+            await query.edit_message_text(f"✅ File '{filename}' deleted.", reply_markup=add_back_button([]))
         else:
             await query.answer("❌ File not found", show_alert=True)
         return
-
-    await query.answer("❌ Action not recognized", show_alert=True)
 
 
 # ===== HANDLE TEXT (FOLDER NAMES) =====
@@ -296,3 +302,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
