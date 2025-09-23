@@ -279,7 +279,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_admin = user.username == ADMIN_USERNAME
     
     await update.message.reply_text(
-        "📁 Welcome to Cybersecurity Lectures Bot\n\n🚀 Now running with persistent PostgreSQL storage!\n\nBrowse folders and download files. Admins can manage content.",
+        "📁 Welcome to Cybersecurity Lectures Bot\n\n🚀 Designed by Team OP!\n\nBy OPH.",
         reply_markup=main_menu_buttons(is_admin)
     )
 
@@ -623,3 +623,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
