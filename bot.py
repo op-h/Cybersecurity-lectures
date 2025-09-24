@@ -345,10 +345,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"📁 **Cybersecurity Lectures Bot**\n\n"
-        f"🚀 Powered by {platform} with PostgreSQL\n"
-        f"💾 **Persistent Storage Guaranteed**\n\n"
-        f"Browse folders and download files safely!\n"
-        f"Admins can manage content with confidence.",
+        f"🚀 Designed By Team OP\n"
+        f"💾 **From A ---> Z**\n\n"
+        f"\n"
+        f"OPH.",
         reply_markup=main_menu_buttons(is_admin),
         parse_mode='Markdown'
     )
@@ -734,3 +734,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
