@@ -23,7 +23,19 @@ logger = logging.getLogger(__name__)
 # ===== CONFIG =====
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME")
-DATABASE_URL = os.environ.get("DATABASE_URL")  # Heroku PostgreSQL URL
+# Railway automatically provides PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# If no DATABASE_URL, construct from Railway environment variables
+if not DATABASE_URL:
+    PGHOST = os.environ.get("PGHOST")
+    PGPORT = os.environ.get("PGPORT", "5432")
+    PGDATABASE = os.environ.get("PGDATABASE")
+    PGUSER = os.environ.get("PGUSER")
+    PGPASSWORD = os.environ.get("PGPASSWORD")
+    
+    if all([PGHOST, PGDATABASE, PGUSER, PGPASSWORD]):
+        DATABASE_URL = f"postgresql://{PGUSER}:{PGPASSWORD}@{PGHOST}:{PGPORT}/{PGDATABASE}"
 
 # ===== DATABASE SETUP =====
 class DatabaseManager:
@@ -35,11 +47,20 @@ class DatabaseManager:
     def connect(self):
         """Connect to PostgreSQL database"""
         try:
+            # Railway/Render require SSL
             self.conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-            logger.info("Connected to PostgreSQL database")
+            self.conn.autocommit = True  # Auto-commit for better reliability
+            logger.info("✅ Connected to PostgreSQL database")
         except Exception as e:
-            logger.error(f"Database connection error: {e}")
-            raise
+            logger.error(f"❌ Database connection error: {e}")
+            # Fallback: try without SSL for local development
+            try:
+                self.conn = psycopg2.connect(DATABASE_URL)
+                self.conn.autocommit = True
+                logger.info("✅ Connected to PostgreSQL database (no SSL)")
+            except Exception as e2:
+                logger.error(f"❌ Database connection failed completely: {e2}")
+                raise
 
     def create_tables(self):
         """Create tables if they don't exist"""
@@ -63,11 +84,16 @@ class DatabaseManager:
                         filename TEXT NOT NULL,
                         folder_path TEXT NOT NULL,
                         file_id TEXT NOT NULL,
-                        file_type TEXT,
+                        file_type TEXT DEFAULT 'document',
+                        file_size BIGINT DEFAULT 0,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         UNIQUE(filename, folder_path)
                     )
                 ''')
+                
+                # Create indexes for better performance
+                cur.execute('CREATE INDEX IF NOT EXISTS idx_folders_parent_path ON folders(parent_path)')
+                cur.execute('CREATE INDEX IF NOT EXISTS idx_files_folder_path ON files(folder_path)')
                 
                 # Create root folder if it doesn't exist
                 cur.execute('''
@@ -76,10 +102,9 @@ class DatabaseManager:
                     ON CONFLICT (path) DO NOTHING
                 ''')
                 
-                self.conn.commit()
-                logger.info("Database tables created/verified")
+                logger.info("✅ Database tables created/verified successfully")
         except Exception as e:
-            logger.error(f"Error creating tables: {e}")
+            logger.error(f"❌ Error creating tables: {e}")
             raise
 
     def get_folder_structure(self, path='/'):
@@ -107,7 +132,7 @@ class DatabaseManager:
                     'files': files
                 }
         except Exception as e:
-            logger.error(f"Error getting folder structure: {e}")
+            logger.error(f"❌ Error getting folder structure: {e}")
             return {'subfolders': {}, 'files': {}}
 
     def create_folder(self, parent_path, folder_name):
@@ -122,14 +147,13 @@ class DatabaseManager:
                     INSERT INTO folders (path, name, parent_path) 
                     VALUES (%s, %s, %s)
                 ''', (new_path, folder_name, parent_path))
-                self.conn.commit()
+                logger.info(f"✅ Created folder: {new_path}")
                 return True
         except psycopg2.IntegrityError:
-            self.conn.rollback()
+            logger.warning(f"⚠️ Folder already exists: {folder_name}")
             return False  # Folder already exists
         except Exception as e:
-            logger.error(f"Error creating folder: {e}")
-            self.conn.rollback()
+            logger.error(f"❌ Error creating folder: {e}")
             return False
 
     def delete_folder(self, parent_path, folder_name):
@@ -152,28 +176,30 @@ class DatabaseManager:
                     WHERE path LIKE %s
                 ''', (f"{folder_path}%",))
                 
-                self.conn.commit()
+                logger.info(f"✅ Deleted folder and contents: {folder_path}")
                 return True
         except Exception as e:
-            logger.error(f"Error deleting folder: {e}")
-            self.conn.rollback()
+            logger.error(f"❌ Error deleting folder: {e}")
             return False
 
-    def add_file(self, folder_path, filename, file_id, file_type='document'):
+    def add_file(self, folder_path, filename, file_id, file_type='document', file_size=0):
         """Add a file to the database"""
         try:
             with self.conn.cursor() as cur:
                 cur.execute('''
-                    INSERT INTO files (filename, folder_path, file_id, file_type) 
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO files (filename, folder_path, file_id, file_type, file_size) 
+                    VALUES (%s, %s, %s, %s, %s)
                     ON CONFLICT (filename, folder_path) 
-                    DO UPDATE SET file_id = EXCLUDED.file_id, file_type = EXCLUDED.file_type
-                ''', (filename, folder_path, file_id, file_type))
-                self.conn.commit()
+                    DO UPDATE SET 
+                        file_id = EXCLUDED.file_id, 
+                        file_type = EXCLUDED.file_type,
+                        file_size = EXCLUDED.file_size,
+                        created_at = CURRENT_TIMESTAMP
+                ''', (filename, folder_path, file_id, file_type, file_size))
+                logger.info(f"✅ Added file: {filename} to {folder_path}")
                 return True
         except Exception as e:
-            logger.error(f"Error adding file: {e}")
-            self.conn.rollback()
+            logger.error(f"❌ Error adding file: {e}")
             return False
 
     def delete_file(self, folder_path, filename):
@@ -184,11 +210,10 @@ class DatabaseManager:
                     DELETE FROM files 
                     WHERE filename = %s AND folder_path = %s
                 ''', (filename, folder_path))
-                self.conn.commit()
+                logger.info(f"✅ Deleted file: {filename} from {folder_path}")
                 return True
         except Exception as e:
-            logger.error(f"Error deleting file: {e}")
-            self.conn.rollback()
+            logger.error(f"❌ Error deleting file: {e}")
             return False
 
     def get_file_id(self, folder_path, filename):
@@ -202,7 +227,7 @@ class DatabaseManager:
                 result = cur.fetchone()
                 return result[0] if result else None
         except Exception as e:
-            logger.error(f"Error getting file ID: {e}")
+            logger.error(f"❌ Error getting file ID: {e}")
             return None
 
     def get_stats(self):
@@ -215,18 +240,26 @@ class DatabaseManager:
                 cur.execute('SELECT COUNT(*) FROM files')
                 file_count = cur.fetchone()[0]
                 
-                return folder_count, file_count
+                cur.execute('SELECT SUM(file_size) FROM files')
+                total_size = cur.fetchone()[0] or 0
+                
+                return folder_count, file_count, total_size
         except Exception as e:
-            logger.error(f"Error getting stats: {e}")
-            return 0, 0
+            logger.error(f"❌ Error getting stats: {e}")
+            return 0, 0, 0
 
     def close(self):
         """Close database connection"""
         if self.conn:
             self.conn.close()
+            logger.info("🔐 Database connection closed")
 
 # Initialize database
-db = DatabaseManager()
+try:
+    db = DatabaseManager()
+except Exception as e:
+    logger.error(f"❌ Failed to initialize database: {e}")
+    db = None
 
 # ===== STORAGE =====
 user_paths = {}  # track user navigation {user_id: ["Folder1", ...]}
@@ -238,6 +271,32 @@ def path_to_string(path_list):
     if not path_list:
         return '/'
     return '/' + '/'.join(path_list)
+
+def format_file_size(size_bytes):
+    """Format file size in human readable format"""
+    if size_bytes == 0:
+        return "0 B"
+    size_names = ["B", "KB", "MB", "GB"]
+    i = 0
+    while size_bytes >= 1024 and i < len(size_names) - 1:
+        size_bytes /= 1024.0
+        i += 1
+    return f"{size_bytes:.1f} {size_names[i]}"
+
+async def safe_edit_message(query, text, reply_markup=None):
+    """Safely edit message with error handling for 'Message is not modified' error"""
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup)
+    except Exception as e:
+        if "Message is not modified" in str(e):
+            # Message content is the same, just answer callback to remove loading state
+            await query.answer("✅ Already up to date!")
+        elif "Message can't be edited" in str(e):
+            # Message is too old to edit, send new message
+            await query.message.reply_text(text, reply_markup=reply_markup)
+        else:
+            logger.error(f"❌ Error editing message: {e}")
+            await query.answer("❌ Error updating interface", show_alert=True)
 
 def add_back_button(buttons: list) -> InlineKeyboardMarkup:
     buttons.append([InlineKeyboardButton("🔙 Back", callback_data="back")])
@@ -278,15 +337,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_paths[user.id] = []
     is_admin = user.username == ADMIN_USERNAME
     
+    if not db:
+        await update.message.reply_text("❌ Database connection failed. Please contact admin.")
+        return
+    
+    platform = "🚂 Railway" if "railway" in os.environ.get("RAILWAY_ENVIRONMENT_NAME", "").lower() else "☁️ Cloud"
+    
     await update.message.reply_text(
-        "📁 Welcome to Cybersecurity Lectures Bot\n\n🚀 Designed by Team OP!\n\nBy OPH.",
-        reply_markup=main_menu_buttons(is_admin)
+        f"📁 **Cybersecurity Lectures Bot**\n\n"
+        f"🚀 Powered by {platform} with PostgreSQL\n"
+        f"💾 **Persistent Storage Guaranteed**\n\n"
+        f"Browse folders and download files safely!\n"
+        f"Admins can manage content with confidence.",
+        reply_markup=main_menu_buttons(is_admin),
+        parse_mode='Markdown'
     )
 
 # ===== BUTTON HANDLER =====
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    
+    if not db:
+        await query.answer("❌ Database unavailable", show_alert=True)
+        return
     
     # ---- CLOSE INTERFACE ----
     if query.data == "close_interface":
@@ -312,9 +386,9 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             folder_data = db.get_folder_structure(current_path)
             buttons = build_folder_buttons(folder_data, is_admin=is_admin)
             path_display = " > ".join(path) if path else "Root"
-            await query.edit_message_text(f"📂 Current Folder: {path_display}", reply_markup=add_back_button(buttons))
+            await safe_edit_message(query, f"📂 Current Folder: {path_display}", add_back_button(buttons))
         else:
-            await query.edit_message_text("📁 Main Menu", reply_markup=main_menu_buttons(is_admin))
+            await safe_edit_message(query, "📁 Main Menu", main_menu_buttons(is_admin))
         return
 
     # ---- CLEAR INTERFACE ----
@@ -339,7 +413,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_paths[user.id] = []
         folder_data = db.get_folder_structure('/')
         buttons = build_folder_buttons(folder_data, is_admin=is_admin)
-        await query.edit_message_text("📂 Root Folders:", reply_markup=add_back_button(buttons))
+        await safe_edit_message(query, "📂 Root Folders:", add_back_button(buttons))
         return
 
     # ---- OPEN FOLDER ----
@@ -352,7 +426,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         folder_data = db.get_folder_structure(new_path)
         buttons = build_folder_buttons(folder_data, is_admin=is_admin)
-        await query.edit_message_text(f"📂 {folder_name}:", reply_markup=add_back_button(buttons))
+        await safe_edit_message(query, f"📂 {folder_name}:", add_back_button(buttons))
         return
 
     # ---- DOWNLOAD FILE ----
@@ -363,8 +437,9 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if file_id:
             try:
                 await query.message.reply_document(file_id, caption=f"📄 {filename}")
+                logger.info(f"✅ File downloaded: {filename}")
             except Exception as e:
-                logger.error(f"Error sending file {filename}: {e}")
+                logger.error(f"❌ Error sending file {filename}: {e}")
                 await query.answer("❌ Error downloading file", show_alert=True)
         else:
             await query.answer("❌ File not found", show_alert=True)
@@ -381,16 +456,28 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("📂 Browse & Manage", callback_data="browse_folders")],
             [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")],
         ]
-        await query.edit_message_text("⚙️ Admin Main Panel", reply_markup=add_back_button(buttons))
+        await safe_edit_message(query, "⚙️ Admin Main Panel", add_back_button(buttons))
         return
 
     # ---- ADMIN STATS ----
     if query.data == "admin_stats":
-        folder_count, file_count = db.get_stats()
-        stats_text = f"📊 Bot Statistics:\n\n📁 Total Folders: {folder_count}\n📄 Total Files: {file_count}\n🗄️ Database: PostgreSQL (Persistent)"
+        folder_count, file_count, total_size = db.get_stats()
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        
+        platform = "🚂 Railway" if "railway" in os.environ.get("RAILWAY_ENVIRONMENT_NAME", "").lower() else "☁️ Cloud"
+        
+        stats_text = (
+            f"📊 **Bot Statistics** (Updated: {timestamp}):\n\n"
+            f"📁 Total Folders: **{folder_count}**\n"
+            f"📄 Total Files: **{file_count}**\n"
+            f"💾 Total Size: **{format_file_size(total_size)}**\n"
+            f"🗄️ Database: **PostgreSQL (Persistent)**\n"
+            f"🌐 Platform: **{platform}**"
+        )
         
         buttons = [[InlineKeyboardButton("🔄 Refresh", callback_data="admin_stats")]]
-        await query.edit_message_text(stats_text, reply_markup=add_back_button(buttons))
+        await safe_edit_message(query, stats_text, add_back_button(buttons))
         return
 
     # ---- ADMIN CURRENT FOLDER PANEL ----
@@ -402,20 +489,20 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🗑️ Delete File", callback_data="delete_file_current")]
         ]
         path_display = " > ".join(path) if path else "Root"
-        await query.edit_message_text(f"⚙️ Admin Panel\n📍 Current: {path_display}", reply_markup=add_back_button(buttons))
+        await safe_edit_message(query, f"⚙️ Admin Panel\n📍 Current: {path_display}", add_back_button(buttons))
         return
 
     # ---- CREATE FOLDER ----
     if query.data == "create_folder_current":
         context.user_data["awaiting_folder_name"] = True
         context.user_data["folder_path"] = path.copy()
-        await query.edit_message_text("✏️ Send the name for the new folder:")
+        await safe_edit_message(query, "✏️ Send the name for the new folder:")
         return
 
     # ---- UPLOAD FILE ----
     if query.data == "upload_current":
         upload_context[user.id] = path.copy()
-        await query.edit_message_text("📤 Now send the file to upload into this folder.")
+        await safe_edit_message(query, "📤 Now send the file to upload into this folder.")
         return
 
     # ---- DELETE FOLDER MENU ----
@@ -424,7 +511,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         subfolders = folder_data.get("subfolders", {})
         
         if not subfolders:
-            await query.edit_message_text("⚠️ No subfolders to delete.", reply_markup=add_back_button([]))
+            await safe_edit_message(query, "⚠️ No subfolders to delete.", add_back_button([]))
             return
             
         buttons = []
@@ -432,7 +519,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             display_name = name[:40] + "..." if len(name) > 40 else name
             buttons.append([InlineKeyboardButton(f"🗑️ {display_name}", callback_data=f"delete_folder_select|{name}")])
             
-        await query.edit_message_text("🗑️ Select a folder to delete:", reply_markup=add_back_button(buttons))
+        await safe_edit_message(query, "🗑️ Select a folder to delete:", add_back_button(buttons))
         return
 
     # ---- DELETE SELECTED FOLDER ----
@@ -440,12 +527,9 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         folder_name = query.data.split("|", 1)[1]
         
         if db.delete_folder(current_path, folder_name):
-            await query.edit_message_text(
-                f"✅ Folder '{folder_name}' deleted successfully.",
-                reply_markup=add_back_button([])
-            )
+            await safe_edit_message(query, f"✅ Folder '{folder_name}' deleted successfully.", add_back_button([]))
         else:
-            await query.edit_message_text("❌ Error deleting folder.", reply_markup=add_back_button([]))
+            await safe_edit_message(query, "❌ Error deleting folder.", add_back_button([]))
         return
 
     # ---- DELETE FILE MENU ----
@@ -454,7 +538,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         files = folder_data.get("files", {})
         
         if not files:
-            await query.edit_message_text("⚠️ No files to delete.", reply_markup=add_back_button([]))
+            await safe_edit_message(query, "⚠️ No files to delete.", add_back_button([]))
             return
         
         buttons = []
@@ -462,7 +546,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             display_name = filename[:40] + "..." if len(filename) > 40 else filename
             buttons.append([InlineKeyboardButton(f"🗑️ {display_name}", callback_data=f"delete_file_select|{filename}")])
         
-        await query.edit_message_text("🗑️ Select a file to delete:", reply_markup=add_back_button(buttons))
+        await safe_edit_message(query, "🗑️ Select a file to delete:", add_back_button(buttons))
         return
 
     # ---- DELETE SELECTED FILE ----
@@ -470,18 +554,19 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filename = query.data.split("|", 1)[1]
         
         if db.delete_file(current_path, filename):
-            await query.edit_message_text(
-                f"✅ File '{filename}' deleted successfully.",
-                reply_markup=add_back_button([])
-            )
+            await safe_edit_message(query, f"✅ File '{filename}' deleted successfully.", add_back_button([]))
         else:
-            await query.edit_message_text("❌ Error deleting file.", reply_markup=add_back_button([]))
+            await safe_edit_message(query, "❌ Error deleting file.", add_back_button([]))
         return
 
 # ===== HANDLE TEXT (FOLDER NAMES) =====
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.username != ADMIN_USERNAME:
+        return
+        
+    if not db:
+        await update.message.reply_text("❌ Database unavailable.")
         return
         
     if context.user_data.get("awaiting_folder_name"):
@@ -515,6 +600,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Not authorized to upload files.")
         return
 
+    if not db:
+        await update.message.reply_text("❌ Database unavailable.")
+        return
+
     path = upload_context.get(user.id, user_paths.get(user.id, []))
     folder_path = path_to_string(path)
 
@@ -522,30 +611,35 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filename = None
         file_id = None
         file_type = "document"
+        file_size = 0
         
         if update.message.document:
             file = update.message.document
             filename = file.file_name or f"document_{file.file_unique_id}"
             file_id = file.file_id
             file_type = "document"
+            file_size = file.file_size or 0
             
         elif update.message.photo:
             photo = update.message.photo[-1]
             filename = f"photo_{photo.file_unique_id}.jpg"
             file_id = photo.file_id
             file_type = "photo"
+            file_size = photo.file_size or 0
             
         elif update.message.video:
             video = update.message.video
             filename = f"video_{video.file_unique_id}.mp4"
             file_id = video.file_id
             file_type = "video"
+            file_size = video.file_size or 0
             
         elif update.message.audio:
             audio = update.message.audio
             filename = audio.file_name or f"audio_{audio.file_unique_id}.mp3"
             file_id = audio.file_id
             file_type = "audio"
+            file_size = audio.file_size or 0
             
         else:
             await update.message.reply_text("❌ Unsupported file type.")
@@ -556,9 +650,17 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filename = f"file_{file_id[:10]}"
 
         # Add file to database
-        if db.add_file(folder_path, filename, file_id, file_type):
+        if db.add_file(folder_path, filename, file_id, file_type, file_size):
             path_display = " > ".join(path) if path else "Root"
-            await update.message.reply_text(f"✅ File '{filename}' uploaded to {path_display}")
+            size_str = format_file_size(file_size)
+            await update.message.reply_text(
+                f"✅ File uploaded successfully!\n\n"
+                f"📄 **{filename}**\n"
+                f"📍 Location: {path_display}\n"
+                f"📊 Size: {size_str}\n"
+                f"🏷️ Type: {file_type}",
+                parse_mode='Markdown'
+            )
         else:
             await update.message.reply_text("❌ Error uploading file to database.")
         
@@ -566,7 +668,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         upload_context.pop(user.id, None)
         
     except Exception as e:
-        logger.error(f"Error uploading file: {e}")
+        logger.error(f"❌ Error uploading file: {e}")
         await update.message.reply_text(f"❌ Error uploading file: {str(e)}")
 
 # ===== ERROR HANDLER =====
@@ -586,15 +688,19 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ===== MAIN =====
 def main():
     if not TOKEN:
-        logger.error("BOT_TOKEN environment variable is required")
+        logger.error("❌ BOT_TOKEN environment variable is required")
         return
         
     if not ADMIN_USERNAME:
-        logger.error("ADMIN_USERNAME environment variable is required")
+        logger.error("❌ ADMIN_USERNAME environment variable is required")
         return
         
     if not DATABASE_URL:
-        logger.error("DATABASE_URL environment variable is required")
+        logger.error("❌ DATABASE_URL or PostgreSQL environment variables are required")
+        return
+
+    if not db:
+        logger.error("❌ Database connection failed - cannot start bot")
         return
 
     try:
@@ -612,15 +718,19 @@ def main():
         # Add error handler
         app.add_error_handler(error_handler)
         
-        logger.info("✅ File Manager Bot starting with PostgreSQL persistence...")
-        app.run_polling()
+        # Detect platform
+        platform = "Railway" if os.environ.get("RAILWAY_ENVIRONMENT_NAME") else "Cloud Platform"
+        logger.info(f"✅ File Manager Bot starting on {platform} with PostgreSQL persistence...")
+        
+        # Start polling
+        app.run_polling(drop_pending_updates=True)
         
     except Exception as e:
-        logger.error(f"Failed to start bot: {e}")
+        logger.error(f"❌ Failed to start bot: {e}")
     finally:
         # Close database connection on shutdown
-        db.close()
+        if db:
+            db.close()
 
 if __name__ == "__main__":
     main()
-
