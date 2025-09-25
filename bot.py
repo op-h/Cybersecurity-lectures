@@ -240,8 +240,9 @@ class DatabaseManager:
                 cur.execute('SELECT COUNT(*) FROM files')
                 file_count = cur.fetchone()[0]
                 
-                cur.execute('SELECT SUM(file_size) FROM files')
-                total_size = cur.fetchone()[0] or 0
+                cur.execute('SELECT COALESCE(SUM(file_size), 0)::BIGINT FROM files')
+                total_size_result = cur.fetchone()[0]
+                total_size = int(total_size_result) if total_size_result else 0
                 
                 return folder_count, file_count, total_size
         except Exception as e:
@@ -274,9 +275,14 @@ def path_to_string(path_list):
 
 def format_file_size(size_bytes):
     """Format file size in human readable format"""
+    # Convert decimal.Decimal to float if needed
+    if size_bytes is None:
+        size_bytes = 0
+    size_bytes = float(size_bytes)
+    
     if size_bytes == 0:
         return "0 B"
-    size_names = ["B", "KB", "MB", "GB"]
+    size_names = ["B", "KB", "MB", "GB", "TB"]
     i = 0
     while size_bytes >= 1024 and i < len(size_names) - 1:
         size_bytes /= 1024.0
@@ -346,6 +352,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📁 **Cybersecurity Lectures Bot**\n\n"
         f"🚀 Designed By Team OP\n"
+        f"\n"
         f"💾 **From A ---> Z**\n\n"
         f"\n"
         f"OPH.",
@@ -734,4 +741,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
